@@ -1,13 +1,26 @@
 from __future__ import annotations
 
 import json
+
 import httpx
 
-from ..base import BaseProvider, DEFAULT_HEADERS, extract_text, parse_html, unwrap_bing_url
+from ..base import DEFAULT_HEADERS, BaseProvider
+from ..html_utils import clean_int, clean_str, compile_xpath, extract_text, parse_html
 from ..models import SearchCategory, SearchResult
+from ..url_utils import is_http_url, unwrap_bing_url
+
+_XP_ALGO = compile_xpath('//ol[@id="b_results"]/li[contains(@class, "b_algo")]')
+_XP_H2_A = compile_xpath(".//h2/a")
+_XP_CAPTION_P = compile_xpath('.//div[contains(@class, "b_caption")]//p')
+_XP_ANY_P = compile_xpath(".//p")
+_XP_IUSC = compile_xpath('//a[contains(@class, "iusc")]')
+_XP_VIDEO_CARD = compile_xpath('//div[contains(@class, "dg_u")]')
+_XP_VRHM = compile_xpath('.//div[contains(@class, "vrhdata")]/@vrhm')
 
 
 class BingProvider(BaseProvider):
+    """Bing web, image, and video provider with ck/a tracking URL decoding."""
+
     name = "bing"
     supports_text = True
     supports_images = True
@@ -16,27 +29,36 @@ class BingProvider(BaseProvider):
     async def search_text(
         self, client: httpx.AsyncClient, query: str, limit: int = 10
     ) -> list[SearchResult]:
-        resp = await client.get(
+        if limit <= 0:
+            return []
+        resp = await self._request(
+            client,
+            "GET",
             "https://www.bing.com/search",
             params={"q": query, "setlang": "en"},
             headers=DEFAULT_HEADERS,
         )
-        resp.raise_for_status()
         dom = parse_html(resp.text)
 
         results: list[SearchResult] = []
-        for item in dom.xpath('//ol[@id="b_results"]/li[contains(@class, "b_algo")]'):
+        for item in _XP_ALGO(dom):
             if len(results) >= limit:
                 break
-            links = item.xpath(".//h2/a")
+            links = _XP_H2_A(item)
             if not links:
                 continue
-            href = unwrap_bing_url(links[0].attrib.get("href", "").strip())
+            href = unwrap_bing_url(clean_str(links[0].attrib.get("href")))
             title = extract_text(links[0])
-            if not href or not title:
+            if not title or not is_http_url(href):
                 continue
-            snippet_els = item.xpath(".//p")
-            snippet = extract_text(snippet_els[0]) if snippet_els else ""
+
+            snippet = ""
+            for el in _XP_CAPTION_P(item) or _XP_ANY_P(item):
+                candidate = extract_text(el)
+                if candidate:
+                    snippet = candidate
+                    break
+
             results.append(
                 SearchResult(
                     category=SearchCategory.TEXT,
@@ -51,16 +73,19 @@ class BingProvider(BaseProvider):
     async def search_images(
         self, client: httpx.AsyncClient, query: str, limit: int = 10
     ) -> list[SearchResult]:
-        resp = await client.get(
+        if limit <= 0:
+            return []
+        resp = await self._request(
+            client,
+            "GET",
             "https://www.bing.com/images/search",
             params={"q": query, "form": "HDRSC2"},
             headers=DEFAULT_HEADERS,
         )
-        resp.raise_for_status()
         dom = parse_html(resp.text)
 
         results: list[SearchResult] = []
-        for el in dom.xpath('//a[contains(@class, "iusc")]'):
+        for el in _XP_IUSC(dom):
             if len(results) >= limit:
                 break
             m_attr = el.attrib.get("m")
@@ -70,17 +95,21 @@ class BingProvider(BaseProvider):
                 meta = json.loads(m_attr)
             except json.JSONDecodeError:
                 continue
-            img_url = meta.get("murl")
-            if not img_url:
+            if not isinstance(meta, dict):
+                continue
+            img_url = clean_str(meta.get("murl"))
+            if not is_http_url(img_url):
                 continue
             results.append(
                 SearchResult(
                     category=SearchCategory.IMAGES,
                     provider=self.name,
-                    title=meta.get("t", ""),
+                    title=clean_str(meta.get("t")),
                     url=img_url,
-                    thumbnail_url=meta.get("turl", ""),
-                    source_url=meta.get("purl", ""),
+                    thumbnail_url=clean_str(meta.get("turl")),
+                    source_url=clean_str(meta.get("purl")),
+                    width=clean_int(meta.get("mw") or meta.get("w")),
+                    height=clean_int(meta.get("mh") or meta.get("h")),
                 )
             )
         return results
@@ -88,36 +117,41 @@ class BingProvider(BaseProvider):
     async def search_videos(
         self, client: httpx.AsyncClient, query: str, limit: int = 10
     ) -> list[SearchResult]:
-        resp = await client.get(
+        if limit <= 0:
+            return []
+        resp = await self._request(
+            client,
+            "GET",
             "https://www.bing.com/videos/search",
             params={"q": query},
             headers=DEFAULT_HEADERS,
         )
-        resp.raise_for_status()
         dom = parse_html(resp.text)
 
         results: list[SearchResult] = []
-        for card in dom.xpath('//div[contains(@class, "dg_u")]'):
+        for card in _XP_VIDEO_CARD(dom):
             if len(results) >= limit:
                 break
-            vrh = card.xpath('.//div[contains(@class, "vrhdata")]/@vrhm')
+            vrh = _XP_VRHM(card)
             if not vrh:
                 continue
             try:
                 meta = json.loads(vrh[0])
             except json.JSONDecodeError:
                 continue
-            url = meta.get("murl") or meta.get("pgurl")
-            if not url:
+            if not isinstance(meta, dict):
+                continue
+            url = clean_str(meta.get("murl")) or clean_str(meta.get("pgurl"))
+            if not is_http_url(url):
                 continue
             results.append(
                 SearchResult(
                     category=SearchCategory.VIDEOS,
                     provider=self.name,
-                    title=meta.get("vt", ""),
+                    title=clean_str(meta.get("vt")),
                     url=url,
-                    thumbnail_url=meta.get("turl", ""),
-                    duration=str(meta.get("du", "")),
+                    thumbnail_url=clean_str(meta.get("turl")),
+                    duration=clean_str(meta.get("du")),
                 )
             )
         return results

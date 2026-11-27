@@ -1,50 +1,76 @@
 from __future__ import annotations
 
-import re
+from urllib.parse import quote
+
 import httpx
 
-from ..base import BaseProvider, DEFAULT_HEADERS
+from ..base import BaseProvider, ProviderError
+from ..html_utils import clean_int, clean_snippet, clean_str
 from ..models import SearchCategory, SearchResult
+from ..url_utils import is_http_url
 
-_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_WIKI_HEADERS: dict[str, str] = {
+    "User-Agent": "msearchy/2.0.0 (https://github.com/Adarshukumar/msearchy)",
+    "Api-User-Agent": "msearchy/2.0.0 (https://github.com/Adarshukumar/msearchy)",
+    "Accept": "application/json",
+}
 
 
 class WikipediaProvider(BaseProvider):
+    """Wikipedia text and Wikimedia Commons image search provider."""
+
     name = "wikipedia"
     supports_text = True
     supports_images = True
     supports_videos = False
 
+    def __init__(self, lang: str = "en") -> None:
+        self.lang = lang.strip().lower() or "en"
+
     async def search_text(
         self, client: httpx.AsyncClient, query: str, limit: int = 10
     ) -> list[SearchResult]:
-        resp = await client.get(
-            "https://en.wikipedia.org/w/api.php",
+        if limit <= 0:
+            return []
+        resp = await self._request(
+            client,
+            "GET",
+            f"https://{self.lang}.wikipedia.org/w/api.php",
             params={
                 "action": "query",
                 "list": "search",
                 "srsearch": query,
-                "srlimit": min(limit, 20),
+                "srlimit": min(limit, 50),
                 "format": "json",
             },
-            headers={**DEFAULT_HEADERS, "Api-User-Agent": "Searchy/1.0"},
+            headers=_WIKI_HEADERS,
         )
-        resp.raise_for_status()
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise ProviderError("Wikipedia API returned invalid JSON") from exc
 
+        if not isinstance(data, dict):
+            return []
+
+        items = (data.get("query") or {}).get("search") or []
         results: list[SearchResult] = []
-        for item in data.get("query", {}).get("search", [])[:limit]:
-            title = item.get("title", "")
+        for item in items:
+            if len(results) >= limit:
+                break
+            if not isinstance(item, dict):
+                continue
+            title = clean_str(item.get("title"))
             if not title:
                 continue
-            slug = title.replace(" ", "_")
-            snippet = _HTML_TAG_RE.sub("", item.get("snippet", ""))
+            slug = quote(title.replace(" ", "_"), safe="_-.~():,'")
+            snippet = clean_snippet(clean_str(item.get("snippet")))
             results.append(
                 SearchResult(
                     category=SearchCategory.TEXT,
                     provider=self.name,
                     title=title,
-                    url=f"https://en.wikipedia.org/wiki/{slug}",
+                    url=f"https://{self.lang}.wikipedia.org/wiki/{slug}",
                     snippet=snippet,
                 )
             )
@@ -53,44 +79,61 @@ class WikipediaProvider(BaseProvider):
     async def search_images(
         self, client: httpx.AsyncClient, query: str, limit: int = 10
     ) -> list[SearchResult]:
-        resp = await client.get(
+        if limit <= 0:
+            return []
+        resp = await self._request(
+            client,
+            "GET",
             "https://commons.wikimedia.org/w/api.php",
             params={
                 "action": "query",
                 "generator": "search",
                 "gsrsearch": f"filetype:bitmap {query}",
                 "gsrnamespace": "6",
-                "gsrlimit": min(limit, 20),
+                "gsrlimit": min(limit, 50),
                 "prop": "imageinfo",
                 "iiprop": "url|size",
                 "iiurlwidth": "400",
                 "format": "json",
             },
-            headers={**DEFAULT_HEADERS, "Api-User-Agent": "Searchy/1.0"},
+            headers=_WIKI_HEADERS,
         )
-        resp.raise_for_status()
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise ProviderError("Wikimedia Commons API returned invalid JSON") from exc
+
+        if not isinstance(data, dict):
+            return []
+
+        pages = (data.get("query") or {}).get("pages") or {}
+        if not isinstance(pages, dict):
+            return []
 
         results: list[SearchResult] = []
-        pages = data.get("query", {}).get("pages", {})
-        for page in list(pages.values())[:limit]:
+        for page in pages.values():
+            if len(results) >= limit:
+                break
+            if not isinstance(page, dict):
+                continue
             info_list = page.get("imageinfo") or []
-            if not info_list:
+            if not info_list or not isinstance(info_list[0], dict):
                 continue
             info = info_list[0]
-            img_url = info.get("url")
-            if not img_url:
+            img_url = clean_str(info.get("url"))
+            if not is_http_url(img_url):
                 continue
+            raw_title = clean_str(page.get("title"))
             results.append(
                 SearchResult(
                     category=SearchCategory.IMAGES,
                     provider=self.name,
-                    title=page.get("title", "").removeprefix("File:"),
+                    title=raw_title.removeprefix("File:"),
                     url=img_url,
-                    thumbnail_url=info.get("thumburl", ""),
-                    source_url=info.get("descriptionurl", ""),
-                    width=info.get("width"),
-                    height=info.get("height"),
+                    thumbnail_url=clean_str(info.get("thumburl")),
+                    source_url=clean_str(info.get("descriptionurl")),
+                    width=clean_int(info.get("width")),
+                    height=clean_int(info.get("height")),
                 )
             )
         return results
