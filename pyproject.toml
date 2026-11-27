@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "msearchy"
+version = "1.0.0"
+description = "Parallel multi-provider metasearch library for text, images, and videos."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "Adarsh" }
+]
+dependencies = [
+    "httpx>=0.24.0",
+    "lxml>=4.9.0",
+    "pydantic>=2.0.0",
+]
+
+[project.scripts]
+searchy = "searchy.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
